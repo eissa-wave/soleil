@@ -179,6 +179,8 @@ def compute_net_delta(
     all_tokens = sorted(set(list(bn_exposure.keys()) + list(gate_holdings.keys())))
     deltas = []
     for token in all_tokens:
+        if token == "USDT":
+            continue
         perp_qty = bn_exposure.get(token, 0.0)
         spot_qty = gate_holdings.get(token, 0.0)
         net_qty = spot_qty + perp_qty
