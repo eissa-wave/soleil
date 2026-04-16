@@ -180,6 +180,7 @@ def compute_net_delta(
     deltas = []
     for token in all_tokens:
         if token == "USDT":
+            print("skipping USDT delta")
             continue
         perp_qty = bn_exposure.get(token, 0.0)
         spot_qty = gate_holdings.get(token, 0.0)
