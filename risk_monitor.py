@@ -13,6 +13,7 @@ import hashlib
 import traceback
 import requests
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 from binance.client import Client
 
@@ -21,6 +22,8 @@ BINANCE_API_KEY    = os.environ["BINANCE_API_KEY"]
 BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
 GATE_API_KEY       = os.environ["GATE_API_KEY"]
 GATE_API_SECRET    = os.environ["GATE_API_SECRET"]
+MEXC_API_KEY       = os.environ["MEXC_API_KEY"]
+MEXC_API_SECRET    = os.environ["MEXC_API_SECRET"]
 SLACK_WEBHOOK      = os.environ["SLACK_WEBHOOK"]
 
 LEVERAGE_THRESHOLD = 2.5
@@ -29,6 +32,8 @@ DELTA_THRESHOLD    = 2000.0
 
 GATE_HOST   = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
+
+MEXC_HOST = "https://api.mexc.com"
 
 
 def send_slack_alert(message: str):
@@ -162,13 +167,56 @@ def fetch_gate_spot_prices(currencies: List[str]) -> Dict[str, float]:
     return prices
 
 
-def compute_gate_equity(holdings: Dict[str, float], prices: Dict[str, float]) -> float:
+def mexc_signed_get(path: str, params: Optional[Dict[str, Any]] = None):
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    query = urlencode(params)
+    sig = hmac.new(MEXC_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    query += f"&signature={sig}"
+    headers = {"X-MEXC-APIKEY": MEXC_API_KEY}
+    r = requests.get(f"{MEXC_HOST}{path}?{query}", headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_mexc_spot_holdings() -> Dict[str, float]:
+    data = mexc_signed_get("/api/v3/account")
+    holdings: Dict[str, float] = {}
+    for row in data.get("balances", []):
+        total = float(row.get("free", 0) or 0) + float(row.get("locked", 0) or 0)
+        if total != 0:
+            holdings[row["asset"]] = total
+    return holdings
+
+
+def fetch_mexc_spot_prices(currencies: List[str]) -> Dict[str, float]:
+    prices: Dict[str, float] = {}
+    stablecoins = {"USDT", "USDC"}
+    for c in currencies:
+        if c in stablecoins:
+            prices[c] = 1.0
+            continue
+        try:
+            r = requests.get(
+                f"{MEXC_HOST}/api/v3/ticker/price",
+                params={"symbol": f"{c}USDT"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            prices[c] = float(r.json().get("price", 0) or 0)
+        except Exception:
+            prices[c] = 0.0
+    return prices
+
+
+def compute_spot_equity(holdings: Dict[str, float], prices: Dict[str, float]) -> float:
     return sum(qty * prices.get(token, 0.0) for token, qty in holdings.items())
 
 
 def compute_net_delta(
     binance_positions: List[Dict[str, Any]],
-    gate_holdings: Dict[str, float],
+    spot_holdings: Dict[str, float],
     prices: Dict[str, float],
 ) -> List[Dict[str, Any]]:
     bn_exposure: Dict[str, float] = {}
@@ -176,14 +224,14 @@ def compute_net_delta(
         token = p["symbol"].replace("USDT", "")
         bn_exposure[token] = bn_exposure.get(token, 0) + p["positionAmt"]
 
-    all_tokens = sorted(set(list(bn_exposure.keys()) + list(gate_holdings.keys())))
+    all_tokens = sorted(set(list(bn_exposure.keys()) + list(spot_holdings.keys())))
     deltas = []
     for token in all_tokens:
         if token == "USDT":
             print("skipping USDT delta")
             continue
         perp_qty = bn_exposure.get(token, 0.0)
-        spot_qty = gate_holdings.get(token, 0.0)
+        spot_qty = spot_holdings.get(token, 0.0)
         net_qty = spot_qty + perp_qty
         price = prices.get(token, 0.0)
         net_usd = net_qty * price
@@ -202,8 +250,11 @@ def main():
     bn_positions: Optional[List[Dict[str, Any]]] = None
     gate_holdings: Optional[Dict[str, float]] = None
     gate_prices: Optional[Dict[str, float]] = None
+    mexc_holdings: Optional[Dict[str, float]] = None
+    mexc_prices: Optional[Dict[str, float]] = None
     binance_ok = True
     gate_ok = True
+    mexc_ok = True
 
     try:
         bn_client = build_binance_client()
@@ -228,33 +279,56 @@ def main():
         print(f"ERROR: Gate.io API failed: {e}", file=sys.stderr)
         gate_ok = False
 
-    if not binance_ok and not gate_ok:
+    try:
+        mexc_holdings = fetch_mexc_spot_holdings()
+        mexc_prices = fetch_mexc_spot_prices(list(mexc_holdings.keys()))
+    except Exception as e:
+        send_slack_error("MEXC API", e)
+        print(f"ERROR: MEXC API failed: {e}", file=sys.stderr)
+        mexc_ok = False
+
+    spot_ok = gate_ok or mexc_ok
+    if not binance_ok and not spot_ok:
         send_slack_alert(
-            ":fire: *Soleil Risk Monitor*: Both Binance and Gate.io API calls failed. "
+            ":fire: *Soleil Risk Monitor*: Binance and all spot venues failed. "
             "No risk data available."
         )
         sys.exit(1)
 
     gross_leverage = 0.0
-    gate_equity = 0.0
-
     if binance_ok:
         gross_leverage = compute_gross_leverage(bn_positions, bn_equity)
 
-    if gate_ok:
-        gate_equity = compute_gate_equity(gate_holdings, gate_prices)
+    gate_equity = compute_spot_equity(gate_holdings, gate_prices) if gate_ok else 0.0
+    mexc_equity = compute_spot_equity(mexc_holdings, mexc_prices) if mexc_ok else 0.0
+    total_equity = (bn_equity or 0.0) + gate_equity + mexc_equity
 
-    total_equity = (bn_equity or 0.0) + gate_equity
+    # merge spot holdings + prices across venues for delta
+    combined_spot: Dict[str, float] = {}
+    combined_prices: Dict[str, float] = {}
+    if gate_ok:
+        for t, q in gate_holdings.items():
+            combined_spot[t] = combined_spot.get(t, 0.0) + q
+        for t, p in gate_prices.items():
+            if p:
+                combined_prices[t] = p
+    if mexc_ok:
+        for t, q in mexc_holdings.items():
+            combined_spot[t] = combined_spot.get(t, 0.0) + q
+        for t, p in mexc_prices.items():
+            if p and not combined_prices.get(t):
+                combined_prices[t] = p
 
     print(f"Binance Equity:   ${bn_equity or 0:,.2f}" + ("" if binance_ok else "  [STALE]"))
     print(f"Gate.io Equity:   ${gate_equity:,.2f}" + ("" if gate_ok else "  [STALE]"))
+    print(f"MEXC Equity:      ${mexc_equity:,.2f}" + ("" if mexc_ok else "  [STALE]"))
     print(f"Total Equity:     ${total_equity:,.2f}")
     print(f"Gross Leverage:   {gross_leverage:.2f}x")
     print()
 
     deltas: List[Dict[str, Any]] = []
-    if binance_ok and gate_ok:
-        deltas = compute_net_delta(bn_positions, gate_holdings, gate_prices)
+    if binance_ok and spot_ok:
+        deltas = compute_net_delta(bn_positions, combined_spot, combined_prices)
 
     if deltas:
         print("Net Delta:")
@@ -272,8 +346,8 @@ def main():
 
     if total_equity < EQUITY_THRESHOLD:
         partial = ""
-        if not binance_ok or not gate_ok:
-            partial = " (partial data - one exchange failed)"
+        if not binance_ok or not gate_ok or not mexc_ok:
+            partial = " (partial data - a venue failed)"
         alerts.append(
             f":rotating_light: *Soleil Equity Alert*: Total portfolio equity is "
             f"${total_equity:,.2f}, reach out to Soleil team immediately! "
